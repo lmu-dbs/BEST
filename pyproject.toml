@@ -1,0 +1,29 @@
+[project]
+name = "best4ppm"
+version = "0.1.0"
+description = "This is a project for mining hierarchical patterns from sequence data to predict future items"
+readme = "README.md"
+authors = [
+  { name = "FirstName LastName", email = "email@provider.abc" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "numpy (>=2.2.3,<3.0.0)",
+    "pandas (>=2.2.3,<3.0.0)",
+    "tqdm (>=4.67.1,<5.0.0)",
+    "scikit-learn (>=1.6.1,<2.0.0)",
+    "pyyaml (>=6.0.2,<7.0.0)",
+]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.commitizen]
+name = "cz_conventional_commits"
+tag_format = "$version"
+version_scheme = "pep440"
+version_provider = "pep621"
+update_changelog_on_bump = true
+major_version_zero = true
