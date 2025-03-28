@@ -124,7 +124,7 @@ def main():
                 if model_config is None:
                     raise KeyError('desired model config not found in model_config.yml')
 
-                best = perform_run_train(data_train, data_test, model_params, general_config, additional_params, times)
+                best = perform_run_train(data_train, data_test, model_params, times)
 
                 for eps in model_params['max_pattern_size_eval']:
 
