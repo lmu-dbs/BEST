@@ -15,6 +15,10 @@ To setup the environment for running our code, we provide a `pyproject.toml` fil
 
 `python -m pip install .`
 
+or with [`poetry`](https://python-poetry.org/) via (execute from the project directory):
+
+`poetry install`
+
 ## Usage
 
 The codebase consists of our module `best4ppm` and different scripts using the module for dataset manipulation (`BPI2012_conversions.py`), event log metric extraction (`log_characteristics.py`) and the experiments for the prediction of next activities and remaining traces (`best_prediction.py`).
