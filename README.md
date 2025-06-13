@@ -1,6 +1,6 @@
 # BEST: Bilaterally Expanding Subtrace Tree for Event Sequence Prediction
 
-This is the implementation accompanying the paper submitted to the BPM Conference 2025 in Seville, Spain (Track II: Engineering)
+This is the implementation accompanying the paper 'BEST: Bilaterally Expanding Subtrace Tree for Event Sequence Prediction' by Simon Rauch, Christian M. M. Frey, Andrea Maldonado and Thomas Seidl submitted to the BPM Conference 2025 in Seville, Spain (Track II: Engineering)
 
 ## Framework
 
