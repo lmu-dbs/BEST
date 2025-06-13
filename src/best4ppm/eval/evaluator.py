@@ -84,21 +84,34 @@ def damerau_levenshtein_dist(pred: list, actual: list, horizon: int|None = None)
     
     distance_mat = np.zeros((len(pred)+1, len(actual)+1))
 
+    cp = {symbol:0 for symbol in set(pred + actual)}
+
     distance_mat[:,0] = range(0, len(pred)+1)
     distance_mat[0,:] = range(0, len(actual)+1)
 
     for i in range(0, len(pred)):
+        
+        cs = 0
+        
         for j in range(0, len(actual)):
 
             if pred[i]==actual[j]:
-                cost = 0
+                d = 0
             else:
-                cost = 1
+                d = 1
             
-            distance_mat[i+1, j+1] = min(distance_mat[i,j+1] + 1, distance_mat[i+1,j] + 1, distance_mat[i,j] + cost)
+            distance_mat[i+1, j+1] = min(distance_mat[i,j+1] + 1, distance_mat[i+1,j] + 1, distance_mat[i,j] + d)
 
-            if i > 1 and j > 1 and pred[i]==actual[j-1] and pred[i-1]==actual[j]:
-                    distance_mat[i+1,j+1] = min(distance_mat[i+1,j+1], distance_mat[i-1,j-1] + 1)
+            i_prime = cp[actual[j]]
+            j_prime = cs
+
+            if i_prime > 0 and j_prime > 0:
+                distance_mat[i+1, j+1] = min(distance_mat[i+1,j+1], distance_mat[int(i_prime)-1, int(j_prime)-1]+(i+1-i_prime)+(j+1-j_prime)-1)
+            
+            if pred[i]==actual[j]:
+                cs = j+1
+        
+        cp[pred[i]] = i+1
 
     dl_dist = distance_mat[len(pred), len(actual)]
 
