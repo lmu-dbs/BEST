@@ -118,11 +118,13 @@ def main():
             else:
                 data_train, data_test = data.train_test_split(train_pct=general_config.get('train_pct'), cv=general_config.get('cv_folds'))
                 times['data_prep_time'] = time.perf_counter()
-
+                
                 model_params = dict(zip(list(model_config.keys()), [param for param in combination]))
 
                 if model_config is None:
                     raise KeyError('desired model config not found in model_config.yml')
+                
+                times['run_start_time'] = time.perf_counter()
 
                 best = perform_run_train(data_train, data_test, model_params, times)
 
@@ -134,7 +136,7 @@ def main():
                     run_log_params_metrics['n_process_stages'] = len(best._stages)
 
                     model_params_eval = {key: model_params[key] for key in model_params.keys() if key!='max_pattern_size_eval'}
-                    model_params_eval['max_pattern_size_eval':eps]
+                    model_params_eval['max_pattern_size_eval'] = eps
 
                     run_log_params_metrics['random_seed'] = additional_params['seed']
 
@@ -148,9 +150,6 @@ def main():
 
                     for key, value in model_and_general_params.items():
                         run_log_params_metrics[key] = value
-
-                    run_log_params_metrics['base_cv_hash'] = base_cv_hash
-                    run_log_params_metrics['cv_hash'] = f'{base_cv_hash}_{eval_pattern_size_idx}'
 
                     perform_run_test(best, model_params_eval, general_config, times, run_log_params_metrics)
                     log_to_csv(csv_file=os.path.join(export_path, 'model_params_metrics.csv'), params_metrics=run_log_params_metrics)
