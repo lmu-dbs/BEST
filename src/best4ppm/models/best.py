@@ -1,19 +1,18 @@
 import numpy as np
 import pandas as pd
 import math
-import itertools
-import multiprocessing
+from multiprocessing import shared_memory, Process
+from joblib import Parallel, delayed
 import time
 from collections import Counter
 from tqdm import tqdm
 from enum import Enum
 from sklearn.preprocessing import LabelEncoder
-from concurrent.futures import ProcessPoolExecutor
 from ..data.sequencedata import SequenceData
 from ..util.sequence_utils import _get_pattern_center, _child_matches_with_sequence, _filter_start_end
+from ..util.logging import init_logging
 
-import logging
-logger = logging.getLogger(__name__)
+logger = init_logging(__name__, "best.log")
 
 class Task(Enum):
     NAP = 'nap'
@@ -24,7 +23,7 @@ class BESTPredictor():
     BEST is capable of predicting next activities as well as remaining traces for sequences of activities
     """
 
-    def __init__(self, max_pattern_size, process_stage_width_percentage, min_freq, prune_func):
+    def __init__(self, max_pattern_size, process_stage_width_percentage, min_freq, prune_func, choice_tracker_keys_nap: list[str] = [], choice_tracker_keys_rtp: list[str] = [], parallelization_lib = 'joblib'):
 
         params = {'max_pattern_size':max_pattern_size,
                         'process_stage_width_percentage':process_stage_width_percentage,
@@ -47,8 +46,10 @@ class BESTPredictor():
         self.hca_patterns = None
 
         # length of chosen pattern in prediction tracker
-        self.choice_tracker_nap = {'prob':[], 'len':[], 'dist':[]}
-        self.choice_tracker_rtp = {'prob':[], 'len':[], 'dist':[]}
+        self.choice_tracker_nap = {key:[] for key in choice_tracker_keys_nap}
+        self.choice_tracker_rtp = {key:[] for key in choice_tracker_keys_rtp}
+        
+        self.parallelization_lib = parallelization_lib
         
     def fit(self) -> None:
         """Fitting the model to X (training data). This involves the pattern generation as well as matching
@@ -83,7 +84,7 @@ class BESTPredictor():
         self._unpruned_nodes = unpruned_nodes
         self._stage_trees = stage_trees
 
-    def predict(self, eval_pattern_size: int, task: str, break_buffer: float, filter_tokens: bool, ncores: int) -> list[list[int]]:
+    def predict(self, eval_pattern_size: int, task: str, selection_method: str, break_buffer: float, filter_tokens: bool, ncores: int, weight: float|None = None) -> list[list[int]]:
         """Generates predictions for the chosen task (next activity prediction or remaining trace prediction)
         for a given set of sequences X.
 
@@ -106,36 +107,80 @@ class BESTPredictor():
             raise ValueError(f'invalid task: {task} - only next activity prediction (nap) and \
                                       remaining trace prediction (rtp) are valid tasks')
 
+        convert_start_time = time.perf_counter()
+        prefix_array = _build_prefix_array(self.data_test.relevant_prefixes)
+        pred_start_time = time.perf_counter()
+
         if task==Task.RTP:
             max_prefix_len = max([len(prefix['prefix']) for prefix in self.data_test.relevant_prefixes])
+            
+            max_seq_len = int(break_buffer*max_prefix_len)
 
             predicted_traces = list()
             if ncores == 1:
-                for prefix in tqdm(self.data_test.relevant_prefixes):
-                    prefix_sequence = prefix['prefix']
-                    pred_sequence = self._predict_sequence(prefix=prefix_sequence, eval_pattern_size=eval_pattern_size,
-                                                        break_after_seq_len=break_buffer*max_prefix_len)
-                    
-                    predicted_traces.append(pred_sequence)
+                predicted_traces = np.array([lst + [np.nan] * (max_seq_len - len(lst)) for lst in [self._predict_sequence(eval_pattern_size=eval_pattern_size,
+                                                                                                                          prefix=row,
+                                                                                                                          selection_method=selection_method,
+                                                                                                                          weight=weight,
+                                                                                                                          break_after_seq_len=max_seq_len) for row in tqdm(prefix_array)]])
             else:
-                prefix_batches = [pb for pb in self._batch_prefixes(ncores)]
-                batch_lens = [len(b) for b in self._batch_prefixes(ncores)]
-                with multiprocessing.Manager() as manager:
-                    progress_dict = manager.dict({i: 0 for i in range(ncores)})
+                shm_input, shared_input, shm_result, shared_result = _setup_shared_memory(prefix_array, max_seq_len=max_seq_len)
 
-                    with ProcessPoolExecutor(max_workers=ncores) as executor:
-                        batch_predictions = [executor.submit(self._batch_predict_sequence, 
-                                                             eval_pattern_size, 
-                                                             prefix_batches[i], 
-                                                             break_buffer*max_prefix_len, 
-                                                             i,
-                                                             progress_dict) for i in range(ncores)]
-                        
-                        _progress_monitor(progress_dict, ncores, batch_lens)
+                # generating index slices according to number of workers (ncores)
+                chunksize = len(prefix_array) // ncores
+                slices = [
+                    (i * chunksize, (i + 1) * chunksize if i < ncores - 1 else len(prefix_array))
+                    for i in range(ncores)
+                ]
 
-                predicted_traces = list(itertools.chain(*[f.result() for f in batch_predictions]))
+                if self.parallelization_lib == 'joblib':
+                    t0 = time.perf_counter()
+                    try:
+                        Parallel(n_jobs=ncores)(
+                            delayed(self._shared_worker)(eval_pattern_size, selection_method, weight, i, task, shm_input.name, prefix_array.shape, prefix_array.dtype, s, e, max_seq_len, 
+                            shm_result.name, shared_result.shape, shared_result.dtype,)
+                            for i, (s, e) in enumerate(slices)
+                        )
+                        elapsed = time.perf_counter() - t0
+                        predicted_traces = shared_result.copy()
+                    finally:
+                        for s in [shm_input, shm_result]:
+                            s.close()
+                            s.unlink()
+                            
+                elif self.parallelization_lib == 'multiprocessing':
+                    procs = [
+                        Process(
+                            target=self._shared_worker,
+                            args=(eval_pattern_size, selection_method, weight, i, task, shm_input.name, prefix_array.shape, prefix_array.dtype, s, e, max_seq_len, 
+                            shm_result.name, shared_result.shape, shared_result.dtype,
+                                )
+                        )
+                        for i, (s, e) in enumerate(slices)
+                    ]
 
-            predictions = predicted_traces
+                    t0 = time.perf_counter()
+                    try:
+                        for p in procs: p.start()
+                        for p in procs: p.join()
+                        for p in procs:
+                            if p.exitcode != 0:
+                                raise RuntimeError(f"Worker {p.pid} failed with exit code {p.exitcode}")
+                        elapsed = time.perf_counter() - t0
+                        predicted_traces = shared_result.copy()
+                    finally:
+                        for s in [shm_input, shm_result]:
+                            s.close()
+                            s.unlink()
+                else:
+                    raise ValueError('unknown parallelization method')
+                
+                logger.info(f"Workers done in {elapsed:.3f}s  |  {len(predicted_traces):,} prefixes processed")
+                logger.info(f"Total time elapsed: {time.perf_counter() - pred_start_time:.3f}s")
+
+            pred_duration = time.perf_counter() - pred_start_time
+
+            predictions = _reconvert_traces_from_shared_mem(predicted_traces)
 
             if filter_tokens:
                 filtered_predictions = list()
@@ -149,38 +194,81 @@ class BESTPredictor():
                 predictions = filtered_predictions
         
         elif task==Task.NAP:
-            predicted_activities = list()
+            max_seq_len = 1
             
             if ncores==1:
-                for prefix in tqdm(self.data_test.relevant_prefixes):
-                    prefix_sequence = prefix['prefix']
-                    pred_activity = self._predict_activity(prefix=prefix_sequence,
-                                                           eval_pattern_size=eval_pattern_size)
-                    
-                    predicted_activities.append(pred_activity)
+                predicted_activities = np.array([self._predict_activity(eval_pattern_size=eval_pattern_size,
+                                                                        prefix=row,
+                                                                        selection_method=selection_method,
+                                                                        weight=weight) for row in tqdm(prefix_array)])
+
             else:
-                prefix_batches = [pb for pb in self._batch_prefixes(ncores)]
-                batch_lens = [len(b) for b in self._batch_prefixes(ncores)]
-                with multiprocessing.Manager() as manager:
-                    progress_dict = manager.dict({i: 0 for i in range(ncores)})
+                shm_input, shared_input, shm_result, shared_result = _setup_shared_memory(prefix_array, max_seq_len=max_seq_len)
 
-                    with ProcessPoolExecutor(max_workers=ncores) as executor:
-                        batch_predictions = [executor.submit(self._batch_predict_activity, 
-                                                             eval_pattern_size, 
-                                                             prefix_batches[i], 
-                                                             i,
-                                                             progress_dict) for i in range(ncores)]
-                        
-                        _progress_monitor(progress_dict, ncores, batch_lens)
+                # generating index slices according to number of workers (ncores)
+                chunksize = len(prefix_array) // ncores
+                slices = [
+                    (i * chunksize, (i + 1) * chunksize if i < ncores - 1 else len(prefix_array))
+                    for i in range(ncores)
+                ]
                 
-                predicted_activities = list(itertools.chain(*[f.result() for f in batch_predictions]))
+                if self.parallelization_lib == 'joblib':
+                    t0 = time.perf_counter()
+                    try:
+                        Parallel(n_jobs=ncores)(
+                            delayed(self._shared_worker)(eval_pattern_size, selection_method, weight, i, task, shm_input.name, prefix_array.shape, prefix_array.dtype, s, e, max_seq_len, 
+                            shm_result.name, shared_result.shape, shared_result.dtype,)
+                            for i, (s, e) in enumerate(slices)
+                        )
+                        elapsed = time.perf_counter() - t0
+                        predicted_activities = shared_result.copy()
+                    finally:
+                        for s in [shm_input, shm_result]:
+                            s.close()
+                            s.unlink()
+                            
+                elif self.parallelization_lib == 'multiprocessing':
+                    procs = [
+                        Process(
+                            target=self._shared_worker,
+                            args=(eval_pattern_size, selection_method, weight, i, task, shm_input.name, prefix_array.shape, prefix_array.dtype, s, e, max_seq_len, 
+                                  shm_result.name, shared_result.shape, shared_result.dtype,
+                                  )
+                        )
+                        for i, (s, e) in enumerate(slices)
+                    ]
 
-            predictions = predicted_activities
+                    t0 = time.perf_counter()
+                    try:
+                        for p in procs: p.start()
+                        for p in procs: p.join()
+                        for p in procs:
+                            if p.exitcode != 0:
+                                raise RuntimeError(f"Worker {p.pid} failed with exit code {p.exitcode}")
+                        elapsed = time.perf_counter() - t0
+                        predicted_activities = shared_result.copy()
+                    finally:
+                        for s in [shm_input, shm_result]:
+                            s.close()
+                            s.unlink()
+                else:
+                    raise ValueError('unknown parallelization method')
 
+                logger.info(f"Workers done in {elapsed:.3f}s  |  {len(predicted_activities):,} prefixes processed")
+                logger.info(f"Total time elapsed: {time.perf_counter() - pred_start_time:.3f}s")
 
-        return predictions
+            pred_duration = time.perf_counter() - convert_start_time
 
-    def _predict_sequence(self, eval_pattern_size: int, prefix: list[int], break_after_seq_len: int = 10e5, verbose: bool = False) -> list[int]:
+            if ncores > 1:
+                predictions = _reconvert_activities_from_shared_mem(predicted_activities)
+            else:
+                predictions = predicted_activities
+
+        pred_plus_convert_duration = time.perf_counter() - convert_start_time
+
+        return predictions, pred_duration, pred_plus_convert_duration
+
+    def _predict_sequence(self, eval_pattern_size: int, prefix: list[int], selection_method: str, weight: float|None = None, break_after_seq_len: int = 10e5, verbose: bool = False) -> list[int]:
         """Predicts the remaining activities for a given prefix
 
         Args:
@@ -189,7 +277,9 @@ class BESTPredictor():
         Returns:
            list[int]: the predicted sequence containing the prefix and the predicted remaining activities
         """    
-        predicted_sequence = prefix.copy()
+        predicted_sequence = [int(el) for el in prefix if not np.isnan(el)]
+        initial_prefix_len = len(predicted_sequence)
+
         try:
             last_start = len(predicted_sequence) - predicted_sequence[::-1].index(self.start_activity) - 1
         except ValueError as v_error:
@@ -203,18 +293,18 @@ class BESTPredictor():
         while predicted_sequence[-1] != self.end_activity and len(predicted_sequence) < break_after_seq_len:
             current_process_stage = min(int((len(predicted_sequence[last_start:]) - 1) / self._abs_process_stage_width), max_process_stage)
             
-            current_prediction, pattern_attributes = self._pred_for_process_stage(stage=current_process_stage, eval_pattern_size=eval_pattern_size, sequence=predicted_sequence, verbose=verbose)
+            current_prediction, pattern_attributes = self._pred_for_process_stage(stage=current_process_stage, eval_pattern_size=eval_pattern_size, sequence=predicted_sequence, selection_method=selection_method, weight=weight, verbose=verbose)
             increase_stage, decrease_stage = current_process_stage + 1, current_process_stage - 1
 
             while len(current_prediction)==0 and not (increase_stage>max_process_stage and decrease_stage<min_process_stage):
                 # look for next higher stage
                 increase_stage = min(increase_stage, max_process_stage)
-                current_increase_prediction, increase_pattern_attributes = self._pred_for_process_stage(stage=increase_stage, eval_pattern_size=eval_pattern_size, sequence=predicted_sequence, verbose=verbose)
+                current_increase_prediction, increase_pattern_attributes = self._pred_for_process_stage(stage=increase_stage, eval_pattern_size=eval_pattern_size, sequence=predicted_sequence, selection_method=selection_method, weight=weight, verbose=verbose)
                 increase_stage += 1
 
                 # look for next lower stage
                 decrease_stage = max(decrease_stage, min_process_stage)
-                current_decrease_prediction, decrease_pattern_attributes = self._pred_for_process_stage(stage=decrease_stage, eval_pattern_size=eval_pattern_size, sequence=predicted_sequence, verbose=verbose)
+                current_decrease_prediction, decrease_pattern_attributes = self._pred_for_process_stage(stage=decrease_stage, eval_pattern_size=eval_pattern_size, sequence=predicted_sequence, selection_method=selection_method, weight=weight, verbose=verbose)
                 decrease_stage -= 1
 
                 increase_prob = increase_pattern_attributes.get('prob')
@@ -245,27 +335,42 @@ class BESTPredictor():
                     logger.debug(f'We did not find any further predicted activities for running prediction {predicted_sequence}')
                 return predicted_sequence[len(prefix):]
             
-            for choice_metric in pattern_attributes.keys():
-                self.choice_tracker_rtp[choice_metric].append(pattern_attributes[choice_metric])
+            for choice_metric in self.choice_tracker_rtp.keys():
+                try:
+                    self.choice_tracker_rtp[choice_metric].append(pattern_attributes[choice_metric])
+                except KeyError as e:
+                    wrong_keys = [key for key in self.choice_tracker_rtp.keys() if key not in pattern_attributes.keys()]
+                    raise KeyError(f"Pattern attributes do not match those of the choice trackers - wrong keys: {', '.join(wrong_keys)}") from e
 
             predicted_sequence.extend(current_prediction[1:]) # whole pattern is appended to the prediction
 
-        return predicted_sequence[len(prefix):]
+        return predicted_sequence[initial_prefix_len:]
     
-    def _batch_predict_sequence(self, eval_pattern_size, prefixes, break_after_seq_len, proc_id, progress_dict):
-        predicted_traces = list()
+    def _batch_predict_sequence(self, eval_pattern_size, prefixes, selection_method, weight, break_after_seq_len, worker_id, **kwargs):
+        
+        print_indices = [i for i in range(len(prefixes))][::max(1, int(len(prefixes) / 10))][1:] + [len(prefixes) - 1]
+
+        predicted_sequences = np.zeros((len(prefixes), break_after_seq_len))
+        predicted_sequences[:] = np.nan
+
         for prefix_idx, prefix in enumerate(prefixes):
-            prefix_sequence = prefix['prefix']
-            pred_sequence = self._predict_sequence(prefix=prefix_sequence,
-                                                   eval_pattern_size=eval_pattern_size,
-                                                   break_after_seq_len=break_after_seq_len)
-            progress_dict[proc_id] = prefix_idx + 1
+            pred_sequence = self._predict_sequence(eval_pattern_size=eval_pattern_size, 
+                                                   prefix=prefix, 
+                                                   selection_method=selection_method, 
+                                                   weight=weight, 
+                                                   break_after_seq_len=break_after_seq_len, 
+                                                   **kwargs)
             
-            predicted_traces.append(pred_sequence)
-        return predicted_traces
+            predicted_sequences[prefix_idx, :len(pred_sequence)] = pred_sequence
+
+            if prefix_idx in print_indices:
+                logger.info(f"worker {worker_id}: {prefix_idx} prefixes completed ({100*(prefix_idx+1)/len(prefixes):.2f}%)")
+
+        return predicted_sequences
 
 
-    def _predict_activity(self, eval_pattern_size: int, prefix: list[int], verbose: bool = False) -> int:
+    def _predict_activity(self, eval_pattern_size: int, prefix: list[int], selection_method: str, weight: float|None = None, break_after_seq_len: int = 1, verbose: bool = False) -> int:
+
         """Predicts the next activity for a given sequence
 
         Args:
@@ -275,7 +380,11 @@ class BESTPredictor():
             int: the predicted activity
         """
 
-        predicted_sequence = prefix.copy()
+        if break_after_seq_len != 1:
+            raise ValueError(f"break_after_seq_len should not be overridden - overridden with: {break_after_seq_len}")
+
+        predicted_sequence = [int(el) for el in prefix if not np.isnan(el)]
+
         try:
             last_start = len(predicted_sequence) - predicted_sequence[::-1].index(self.start_activity) - 1
         except ValueError as v_error:
@@ -289,18 +398,18 @@ class BESTPredictor():
         if predicted_sequence[-1] != self.end_activity:
             current_process_stage = min(int((len(predicted_sequence[last_start:]) - 1) / self._abs_process_stage_width), max_process_stage)
             
-            current_prediction, pattern_attributes = self._pred_for_process_stage(stage=current_process_stage, eval_pattern_size=eval_pattern_size, sequence=predicted_sequence, verbose=verbose)
+            current_prediction, pattern_attributes = self._pred_for_process_stage(stage=current_process_stage, eval_pattern_size=eval_pattern_size, sequence=predicted_sequence, selection_method=selection_method, weight=weight, verbose=verbose)
             increase_stage, decrease_stage = current_process_stage + 1, current_process_stage - 1
 
             while len(current_prediction)==0 and not (increase_stage>max_process_stage and decrease_stage<min_process_stage):
                 # look for next higher stage
                 increase_stage = min(increase_stage, max_process_stage)
-                current_increase_prediction, increase_pattern_attributes = self._pred_for_process_stage(stage=increase_stage, eval_pattern_size=eval_pattern_size, sequence=predicted_sequence, verbose=verbose)
+                current_increase_prediction, increase_pattern_attributes = self._pred_for_process_stage(stage=increase_stage, eval_pattern_size=eval_pattern_size, sequence=predicted_sequence, selection_method=selection_method, weight=weight, verbose=verbose)
                 increase_stage += 1
 
                 # look for next lower stage
                 decrease_stage = max(decrease_stage, min_process_stage)
-                current_decrease_prediction, decrease_pattern_attributes = self._pred_for_process_stage(stage=decrease_stage, eval_pattern_size=eval_pattern_size, sequence=predicted_sequence, verbose=verbose)
+                current_decrease_prediction, decrease_pattern_attributes = self._pred_for_process_stage(stage=decrease_stage, eval_pattern_size=eval_pattern_size, sequence=predicted_sequence, selection_method=selection_method, weight=weight, verbose=verbose)
                 decrease_stage -= 1
 
                 increase_prob = increase_pattern_attributes.get('prob')
@@ -329,21 +438,35 @@ class BESTPredictor():
                     print("WE DID NOT FIND ANY SUITABLE PREDICTION FOR THE CURRENT SEQUENCE ANYWHERE")
                 return
             
-            for choice_metric in pattern_attributes.keys():
-                self.choice_tracker_nap[choice_metric].append(pattern_attributes[choice_metric])
+            for choice_metric in self.choice_tracker_nap.keys():
+                try:
+                    self.choice_tracker_nap[choice_metric].append(pattern_attributes[choice_metric])
+                except KeyError as e:
+                    wrong_keys = [key for key in self.choice_tracker_nap.keys() if key not in pattern_attributes.keys()]
+                    raise KeyError(f"Pattern attributes do not match those of the choice trackers - wrong keys: {', '.join(wrong_keys)}") from e
         return current_prediction[1]
 
-    def _batch_predict_activity(self, eval_pattern_size, prefixes, proc_id, progress_dict, **kwargs):
-        predicted_activities = list()
+    def _batch_predict_activity(self, eval_pattern_size, prefixes, selection_method, weight, break_after_seq_len, worker_id, **kwargs):
+
+        print_indices = [i for i in range(len(prefixes))][::max(1, int(len(prefixes) / 10))][1:] + [len(prefixes) - 1]
+
+        predicted_activities = np.zeros((len(prefixes), 1))
+        predicted_activities[:] = np.nan
+
         for prefix_idx, prefix in enumerate(prefixes):
-            prefix_sequence = prefix['prefix']
-            pred_activity = self._predict_activity(prefix=prefix_sequence, 
-                                                   eval_pattern_size=eval_pattern_size, 
+            pred_activity = self._predict_activity(eval_pattern_size=eval_pattern_size, 
+                                                   prefix=prefix, 
+                                                   selection_method=selection_method, 
+                                                   weight=weight, 
+                                                   break_after_seq_len=break_after_seq_len, 
                                                    **kwargs)
+
             
-            progress_dict[proc_id] = prefix_idx + 1
-            
-            predicted_activities.append(pred_activity)
+            predicted_activities[prefix_idx] = pred_activity
+
+            if prefix_idx in print_indices:
+                logger.info(f"worker {worker_id}: {prefix_idx} prefixes completed ({100*(prefix_idx+1)/len(prefixes):.2f}%)")
+
         return predicted_activities
         
     def load_data(self, train: SequenceData, test: SequenceData):
@@ -522,7 +645,7 @@ class BESTPredictor():
         self._matches_per_stage = matches_per_stage
         logger.info(f'Child pattern search completed!')
 
-    def _pred_for_process_stage(self, eval_pattern_size: int, stage: int, sequence: list[int], verbose: bool = False) -> list[int]:
+    def _pred_for_process_stage(self, eval_pattern_size: int, stage: int, sequence: list[int], selection_method: str, weight: float|None = None, verbose: bool = False) -> list[int]:
         
         if self.prune_func is not None:
         
@@ -568,9 +691,6 @@ class BESTPredictor():
             min_dist_pick = np.argmin(argmax_children_dists)        
         else:
             
-            method = 'PROB_LEN_DIST'
-            # method = 'PROB_DIST'
-
             all_applying_children = self.extract_matching_patterns(stage, sequence)
 
             # kick single activity patterns from extracted matching patterns
@@ -588,25 +708,36 @@ class BESTPredictor():
             dists = [p['total_log_rpif_dist'] for p in applying_children]
             lens_children = [len(p['name'].split(',')) for p in applying_children]
 
-            # get max prob children (many conditional probs of 1.0 for the longer patterns)
-            max_prob = max(probs)
-            argmax_prob_indices = [idx for idx, p in enumerate(probs) if p==max_prob]
-            argmax_prob_children_lens = [lens_children[idx] for idx in argmax_prob_indices]
-            argmax_prob_dists = [dists[idx] for idx in argmax_prob_indices]
-            argmax_prob_global_probs = [global_probs[idx] for idx in argmax_prob_indices]
-            max_len = max(argmax_prob_children_lens)
-            max_global_prob = max(argmax_prob_global_probs)
-            argmax_prob_argmax_len_indices = [idx for idx, l in enumerate(lens_children) if l==max_len and idx in argmax_prob_indices]
-            argmax_prob_argmax_len_dists = [dists[idx] for idx in argmax_prob_argmax_len_indices]
-            min_dist = min(argmax_prob_dists)
-            min_dist_max_len = min(argmax_prob_argmax_len_dists)
-            argmax_prob_argmax_len_argmin_dist_indices = [idx for idx, d in enumerate(dists) if d==min_dist_max_len and idx in argmax_prob_argmax_len_indices]
+            # for weighted distance
+            global_probs_parent = [p["global_prob_parent"] for p in applying_children]
+            local_beds = [p["log_rpif_dist"] for p in applying_children]
+            global_beds_parents = [p["total_log_rpif_dist"] - p["log_rpif_dist"] for p in applying_children]
 
-            argmax_prob_argmin_dist_indices = [idx for idx, d in enumerate(dists) if d==min_dist and idx in argmax_prob_indices]
-            argmax_prob_argmax_global_prob_indices = [idx for idx, p in enumerate(global_probs) if p==max_global_prob and idx in argmax_prob_indices]
+            # DIFFERENT SELECTION METHODS:
+            # PROB_LEN_DIST: 1. min(local BED) 2. max pattern length 3. min (global BED) - what we used in the BPM paper
+            # PROB_DIST: 1. min(local BED) 2. min (global BED)
+            # WEIGHTED_DIST: weighted distance metric between local BED and global BED (of the respective parent patterns)
+            # WEIGHTED_DIST_LEN: 1. weighted distance metric from WEIGHTED_DIST 2. max pattern length
+            # WEIGHTED_PROBS: weighted probabilty (sum) between conditional extension probability and global occurrence prob of the parent
+            # WEIGHTED_PROBS_LEN: 1. weighted probabilty (sum) from WEIGHTED_PROBS 2. max pattern length
+            # MAX_JOINT_PROB: joint probability (product) between conditional extension probability and global occurrence prob of the parent
+            # MAX_JOINT_PROB_LEN: 1. joint probability (product) from MAX_JOINT_PROB 2. max pattern length 
 
-            if method == 'PROB_LEN_DIST':
-                # candidate_children = [[int(act) for act in [p['name'] for p in applying_children][pick].split(',')] for pick in argmax_prob_argmax_len_argmin_dist_indices] # with max prob - max len - min dist
+            if selection_method == 'PROB_LEN_DIST':
+                # 1 - filter for max prob (minimal local BED)
+                max_prob = max(probs)
+                argmax_prob_indices = [idx for idx, p in enumerate(probs) if p==max_prob]
+
+                # 2 - filter for maximal match length (longest patterns)
+                argmax_prob_children_lens = [lens_children[idx] for idx in argmax_prob_indices]
+                max_len = max(argmax_prob_children_lens)
+                argmax_prob_argmax_len_indices = [idx for idx, l in enumerate(lens_children) if l==max_len and idx in argmax_prob_indices]
+
+                # 3 - filter for minimal global BED
+                argmax_prob_argmax_len_dists = [dists[idx] for idx in argmax_prob_argmax_len_indices]
+                min_dist_max_len = min(argmax_prob_argmax_len_dists)
+                argmax_prob_argmax_len_argmin_dist_indices = [idx for idx, d in enumerate(dists) if d==min_dist_max_len and idx in argmax_prob_argmax_len_indices]
+            
                 candidate_children = [[p for p in applying_children][pick] for pick in argmax_prob_argmax_len_argmin_dist_indices] # with max prob - max len - min dist
 
                 if len(argmax_prob_argmax_len_argmin_dist_indices) > 1:
@@ -616,9 +747,18 @@ class BESTPredictor():
                     picked_child = candidate_children[np.random.choice(range(0, len(candidate_children)))]
                 else:
                     picked_child = candidate_children[0]
+            
+            elif selection_method == 'PROB_DIST':
+                # 1 - filter for max prob (minimal local BED)
+                max_prob = max(probs)
+                argmax_prob_indices = [idx for idx, p in enumerate(probs) if p==max_prob]
 
-            elif method == 'PROB_DIST':        
-                # candidate_children = [[int(act) for act in [p['name'] for p in applying_children][pick].split(',')] for pick in argmax_prob_argmin_dist_indices] # with max prob - min dist
+                # 2 - filter for minimal global BED
+                argmax_prob_dists = [dists[idx] for idx in argmax_prob_indices]
+                min_dist = min(argmax_prob_dists)
+                argmax_prob_argmax_len_dists = [dists[idx] for idx in argmax_prob_argmax_len_indices]
+                argmax_prob_argmin_dist_indices = [idx for idx, d in enumerate(dists) if d==min_dist and idx in argmax_prob_indices]
+
                 candidate_children = [[p for p in applying_children][pick] for pick in argmax_prob_argmin_dist_indices]
 
                 if len(argmax_prob_argmin_dist_indices) > 1:
@@ -628,6 +768,125 @@ class BESTPredictor():
                     picked_child = candidate_children[np.random.choice(range(0, len(candidate_children)))]
                 else:
                     picked_child = candidate_children[0]
+
+            elif selection_method == "WEIGHTED_DIST":
+                
+                if weight is None:
+                    raise ValueError(f"Need to set a weight for selection method {selection_method}")
+
+                # calculate weighted distance
+                weighted_dists = [weight * lb + (1 - weight) * gbp for lb, gbp in zip(local_beds, global_beds_parents)]
+                min_weighted_dist = min(weighted_dists)
+                argmin_weighted_dist_indices = [idx for idx, wd in enumerate(weighted_dists) if wd == min_weighted_dist]
+                
+                candidate_children = [[p for p in applying_children][pick] for pick in argmin_weighted_dist_indices]
+
+                if len(candidate_children) > 1:
+                    picked_child = candidate_children[
+                        np.random.choice(range(0, len(candidate_children)))
+                    ]
+                else:
+                    picked_child = candidate_children[0]
+            elif selection_method == "WEIGHTED_PROBS":
+
+                if weight is None:
+                    raise ValueError(f"Need to set a weight for selection method {selection_method}")
+
+                # calculate weighted probs
+                weighted_probs = [weight * bed + (1 - weight) * gpp for bed, gpp in zip(probs, global_probs_parent)]
+                max_weighted_probs = max(weighted_probs)
+                argmax_weighted_probs = [idx for idx, wd in enumerate(weighted_probs) if wd == max_weighted_probs]
+                candidate_children = [[p for p in applying_children][pick]for pick in argmax_weighted_probs]
+
+                if len(candidate_children) > 1:
+                    picked_child = candidate_children[
+                        np.random.choice(range(0, len(candidate_children)))
+                    ]
+                else:
+                    picked_child = candidate_children[0]
+            elif selection_method == "WEIGHTED_PROBS_LEN":
+                
+                if weight is None:
+                    raise ValueError(f"Need to set a weight for selection method {selection_method}")
+
+                # 1 - calculate weighted probs
+                weighted_probs = [weight * bed + (1 - weight) * gpp for bed, gpp in zip(probs, global_probs_parent)]
+                max_weighted_probs = max(weighted_probs)
+                argmax_weighted_probs_indices = [idx for idx, wd in enumerate(weighted_probs) if wd == max_weighted_probs]
+
+                # 2 - filter for maximal match length (longest patterns)
+                argmax_weighted_probs_lens = [lens_children[idx] for idx in argmax_weighted_probs_indices]
+                max_len = max(argmax_weighted_probs_lens)
+                argmax_weighted_probs_argmax_len_indices = [idx for idx, l in enumerate(lens_children) if l==max_len and idx in argmax_weighted_probs_indices]
+                
+                candidate_children = [[p for p in applying_children][pick] for pick in argmax_weighted_probs_argmax_len_indices]
+
+                if len(candidate_children) > 1:
+                    picked_child = candidate_children[
+                        np.random.choice(range(0, len(candidate_children)))
+                    ]
+                else:
+                    picked_child = candidate_children[0]
+            elif selection_method == "WEIGHTED_DIST_LEN":
+                
+                if weight is None:
+                    raise ValueError(f"Need to set a weight for selection method {selection_method}")
+
+                # 1 - calculate weighted distance
+                weighted_dists = [weight * lb + (1 - weight) * gbp for lb, gbp in zip(local_beds, global_beds_parents)]
+                min_weighted_dist = min(weighted_dists)
+                argmin_weighted_dist_indices = [idx for idx, wd in enumerate(weighted_dists) if wd == min_weighted_dist]
+
+                # 2 - filter for maximal match length (longest patterns)
+                argmin_weighted_dist_lens = [lens_children[idx] for idx in argmin_weighted_dist_indices]
+                max_len = max(argmin_weighted_dist_lens)
+                argmin_weighted_dist_argmax_len_indices = [idx for idx, l in enumerate(lens_children) if l==max_len and idx in argmin_weighted_dist_indices]
+                
+                candidate_children = [[p for p in applying_children][pick] for pick in argmin_weighted_dist_argmax_len_indices]
+
+                if len(candidate_children) > 1:
+                    picked_child = candidate_children[
+                        np.random.choice(range(0, len(candidate_children)))
+                    ]
+                else:
+                    picked_child = candidate_children[0]
+            elif selection_method == "MAX_JOINT_PROB":
+
+                # calculate joint probs
+                joint_probs = [cp*gpp for cp, gpp in zip(probs, global_probs_parent)]
+                max_joint_probs = max(joint_probs)
+                argmax_joint_probs = [idx for idx, jp in enumerate(joint_probs) if jp == max_joint_probs]
+
+                candidate_children = [[p for p in applying_children][pick] for pick in argmax_joint_probs]
+
+                if len(candidate_children) > 1:
+                    picked_child = candidate_children[
+                        np.random.choice(range(0, len(candidate_children)))
+                    ]
+                else:
+                    picked_child = candidate_children[0]
+            elif selection_method == "MAX_JOINT_PROB_LEN":
+
+                # 1 - calculate join probability
+                joint_probs = [cp*gpp for cp, gpp in zip(probs, global_probs_parent)]
+                max_joint_probs = max(joint_probs)
+                argmax_joint_probs_indices = [idx for idx, jp in enumerate(joint_probs) if jp == max_joint_probs]
+
+                # 2 - filter for maximal match length (longest patterns)
+                argmax_joint_probs_lens = [lens_children[idx] for idx in argmax_joint_probs_indices]
+                max_len = max(argmax_joint_probs_lens)
+                argmax_joint_probs_argmax_len_indices = [idx for idx, l in enumerate(lens_children) if l==max_len and idx in argmax_joint_probs_indices]
+                
+                candidate_children = [[p for p in applying_children][pick] for pick in argmax_joint_probs_argmax_len_indices]
+
+                if len(candidate_children) > 1:
+                    picked_child = candidate_children[
+                        np.random.choice(range(0, len(candidate_children)))
+                    ]
+                else:
+                    picked_child = candidate_children[0]
+            else:
+                raise NotImplementedError(f"Chosen selection method {selection_method} not implemented!")
         
         for prob, length in zip(probs, lens_children):
 
@@ -638,7 +897,14 @@ class BESTPredictor():
 
         pred = picked_pattern[math.floor(len(picked_pattern)/2):]
 
-        return pred, {'prob':picked_child['prob'], 'len':len(picked_pattern), 'dist':picked_child['total_log_rpif_dist']}
+        pattern_attributes = {'prob_local': picked_child['prob'], 
+                              'prob_global': picked_child['global_prob_parent'],
+                              'len': len(picked_pattern), 
+                              'dist_local': picked_child['log_rpif_dist'],
+                              'dist_global': picked_child['total_log_rpif_dist'],
+                              'n_remaining_candidates': len(candidate_children)}
+
+        return pred, pattern_attributes
     
     def _batch_prefixes(self, nbatches: int):
         nprefixes = len(self.data_test.relevant_prefixes)
@@ -646,7 +912,7 @@ class BESTPredictor():
         for ndx in range(0, nprefixes, batchsize):
             yield self.data_test.relevant_prefixes[ndx:min(ndx + batchsize, nprefixes)]
     
-    def extract_matching_patterns(self, process_stage: int, sequence: list[int], current_size: int = 1, current_tree: dict = None, total_log_rpif_dist: float = 0) -> dict:
+    def extract_matching_patterns(self, process_stage: int, sequence: list[int], current_size: int = 1, current_tree: dict = None, total_log_rpif_dist: float = 0, global_prob: float = 1) -> dict:
         
         # initial tree lookup
         if current_tree is None:
@@ -667,11 +933,54 @@ class BESTPredictor():
         
         for mn in matching_nodes[:]: # loop over shallow copy of list of matching nodes
             mn['total_log_rpif_dist'] = total_log_rpif_dist + mn['log_rpif_dist']
+            mn["global_prob_parent"] = global_prob
 
             if current_size < self.max_pattern_size:
-                matching_nodes.extend(self.extract_matching_patterns(process_stage, sequence, current_size+2, mn, mn['total_log_rpif_dist']))
+                matching_nodes.extend(self.extract_matching_patterns(process_stage, sequence, current_size+2, mn, mn['total_log_rpif_dist'], mn["global_prob"]))
 
         return matching_nodes
+    
+    def _shared_worker(self, eval_pattern_size: int, selection_method: str, weight: float, 
+                       worker_id: int, task: str, shm_name: str, shape: tuple, dtype: np.dtype,
+                       start: int, end: int, max_seq_len: int, 
+                       res_shm_name: str, res_shape: tuple, res_shm_dtype: np.dtype,
+                       **kwargs):
+        # attach to input data
+        shm = shared_memory.SharedMemory(name=shm_name)
+        prefix_array = np.ndarray(shape, dtype=dtype, buffer=shm.buf)
+
+        # attach to results buffer
+        res_shm = shared_memory.SharedMemory(name=res_shm_name)
+        res = np.ndarray(res_shape, dtype=res_shm_dtype, buffer=res_shm.buf)
+
+        try: 
+            if task==Task.NAP:
+                result = self._batch_predict_activity(eval_pattern_size=eval_pattern_size, 
+                                                      prefixes=prefix_array[start:end], 
+                                                      selection_method=selection_method, 
+                                                      weight=weight, 
+                                                      break_after_seq_len=max_seq_len, 
+                                                      worker_id=worker_id,
+                                                      **kwargs)
+            elif task==Task.RTP:
+                result = self._batch_predict_sequence(eval_pattern_size=eval_pattern_size, 
+                                                      prefixes=prefix_array[start:end], 
+                                                      selection_method=selection_method, 
+                                                      weight=weight, 
+                                                      break_after_seq_len=max_seq_len, 
+                                                      worker_id=worker_id,
+                                                      **kwargs)
+
+            # write result to shared results buffer
+            res[start:end] = result
+
+        except Exception as e:
+            logger.error(f"something went wrong in worker {worker_id}")
+            raise
+
+        finally:
+            shm.close()
+            res_shm.close()
 
 def _get_matches_dict(pattern: tuple[int], all_matches: dict, max_pattern_size: int, min_k: int = None, max_k: int = None, min_freq: float = None) -> dict:
     """Recursive search of pattern matches given a starting pattern. For each match, we calculate the conditional probability
@@ -835,16 +1144,70 @@ def _rescale_probs(probs):
     probs = probs/sum(probs)
     return probs
 
-def _progress_monitor(progress_dict, num_workers, batch_lens, update_freq = 0.1):
-    """Monitoring dictionary to manage and display multiple progress bars updating in update_freq (sec)."""
-    bars = [tqdm(total=batch_len, position=i, desc=f"Batch {i+1}") for i, batch_len in zip(range(0, num_workers), batch_lens)]
+def _build_prefix_array(prefix_dict: dict):
+    """Builds array of prefixes of different length from list of prefixes. Pads shorter prefixes with np.nan from the left
+
+    Args:
+        prefix_dict (dict): list of prefixes
+    """
+
+    raw_prefixes = [prefix['prefix'] for prefix in prefix_dict]
+    prefix_lens = [len(prefix) for prefix in raw_prefixes]
+    max_prefix_len = max(prefix_lens)
+
+    prefix_array = np.empty((len(prefix_dict), max_prefix_len))
+    prefix_array[:] = np.nan
+
+    for prefix_idx, (prefix, prefix_len) in enumerate(zip(raw_prefixes, prefix_lens)):
+        prefix_array[prefix_idx, max_prefix_len-prefix_len:] = prefix
+
+    return prefix_array
+
+def _setup_shared_memory(data: np.ndarray, max_seq_len: int = None):
+    """Sets up shared memory objects (multiprocessing.shared_memory.SharedMemory) for input data and corresponding results
+    for multiple workers to work on
+
+    Args:
+        data (np.ndarray): prefix information in form of a left-padded np.ndarray
+    """
+    n_rows = len(data)
+
+    # generate shared memory for input data and fill it with the input data
+    shm_input = shared_memory.SharedMemory(create=True, size=data.nbytes)
+    shared_input = np.ndarray(data.shape, dtype=data.dtype, buffer=shm_input.buf)
+    shared_input[:] = data
+
+    # generate shared memory for results - one float per row
+    # shape depends on the task
+    #   NAP - single activities -> 1 float per row
+    #   RTP - full remaining traces -> n floats per row with max_seq_len as shape indicator
+    result_buffer = np.zeros((n_rows, max_seq_len), dtype=np.float64)
+    shm_result = shared_memory.SharedMemory(create=True, size=result_buffer.nbytes)
+    shared_result = np.ndarray(result_buffer.shape, dtype=result_buffer.dtype, buffer=shm_result.buf)
     
-    while any(p < batch_len for p, batch_len in zip(progress_dict.values(), batch_lens)):
-        time.sleep(update_freq)
-        for i in range(num_workers):
-            if bars[i].n < batch_lens[i]:
-                bars[i].n = progress_dict[i]
-                bars[i].refresh()
-    
-    for bar in bars:
-        bar.close()
+    return shm_input, shared_input, shm_result, shared_result
+
+def _reconvert_activities_from_shared_mem(predicted_activities: np.ndarray):
+
+    predicted_activities_list = list()
+    for pa in predicted_activities:
+        try:
+            converted_pa = int(pa)
+        except ValueError:
+            converted_pa = None
+        predicted_activities_list.append(converted_pa)
+
+    return predicted_activities_list
+
+def _reconvert_traces_from_shared_mem(predicted_traces: np.ndarray):
+
+    predicted_traces_list = list()
+    for pt in predicted_traces:
+        try:
+            relevant_trace = [pa for pa in pt if not np.isnan(pa)]
+            converted_pt = [int(pa) for pa in relevant_trace]                
+        except ValueError:
+            converted_pt = None
+        predicted_traces_list.append(converted_pt)
+
+    return predicted_traces_list

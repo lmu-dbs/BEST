@@ -12,8 +12,8 @@ from ..util.sequence_utils import _filter_start_end
 
 from sklearn.preprocessing import LabelEncoder
 
-import logging
-logger = logging.getLogger(__name__)
+from best4ppm.util.logging import init_logging
+logger = init_logging(__name__, 'sequencedata.log')
 
 class SequenceData:
     """Data class for preprocessing of .csv files into sequences that can be processed by the BESTPredictor

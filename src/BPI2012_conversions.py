@@ -1,6 +1,9 @@
 import pandas as pd
 import os
 from best4ppm.util.config_utils import read_config
+from best4ppm.util.logging import init_logging
+
+from util.paths import CONFIG_PATH, DATA_PATH
 
 def convert_BPI(bpi2012_raw_path, conversions_export_path):
 
@@ -19,12 +22,24 @@ def convert_BPI(bpi2012_raw_path, conversions_export_path):
     bpi2012_w_complete.to_csv(os.path.join(conversions_export_path, 'BPI2012_WC.csv'), index=False)
 
 def main():
-    data_configs = read_config(os.path.join(os.path.dirname(os.path.realpath(__file__)), 'best4ppm', 'configs', 'data_configs.yml'))
-    data_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), '..', 'data')
-    os.makedirs(data_path, exist_ok=True)
-    
-    convert_BPI(os.path.join(data_path, data_configs['BPI2012']['file_name']), data_path)
 
-if __name__=='__main__':
+    logger = init_logging(__name__)
+
+    data_configs = read_config(
+        os.path.join(
+            CONFIG_PATH,
+            "data_configs.yml",
+        )
+    )
+
+    logger.info(f"Creating BPI2012 conversions in {DATA_PATH}")
+
+    convert_BPI(
+        os.path.join(DATA_PATH, data_configs["BPI2012"]["file_name"]), DATA_PATH
+    )
+
+    logger.info("BPI2012 conversions created")
+
+
+if __name__ == "__main__":
     main()
-

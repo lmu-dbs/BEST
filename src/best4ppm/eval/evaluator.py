@@ -5,8 +5,8 @@ from sklearn.metrics import accuracy_score
 from sklearn.metrics import balanced_accuracy_score
 from concurrent.futures import ProcessPoolExecutor
 
-import logging
-logger = logging.getLogger(__name__)
+from best4ppm.util.logging import init_logging
+logger = init_logging(__name__, 'evaluator.log')
 
 class Evaluator:
 

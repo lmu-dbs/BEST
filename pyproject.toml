@@ -4,15 +4,16 @@ version = "0.1.0"
 description = "This is a project for mining hierarchical patterns from sequence data to predict future items"
 readme = "README.md"
 authors = [
-  { name = "FirstName LastName", email = "email@provider.abc" }
+  { name = "Simon Rauch", email = "rauch@dbs.ifi.lmu.de" }
 ]
-requires-python = ">=3.12"
+requires-python = ">=3.12,<3.13"
 dependencies = [
-    "numpy (>=2.2.3,<3.0.0)",
+    "numpy (>=2.2.3,<2.4.0)",
     "pandas (>=2.2.3,<3.0.0)",
     "tqdm (>=4.67.1,<5.0.0)",
     "scikit-learn (>=1.6.1,<2.0.0)",
     "pyyaml (>=6.0.2,<7.0.0)",
+    "psutil (>=7.2.2,<8.0.0)",
 ]
 
 
