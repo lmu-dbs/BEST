@@ -1,5 +1,6 @@
 from best4ppm.data.sequencedata import SequenceData
 from best4ppm.util.config_utils import read_config
+from util.paths import DATA_PATH
 import os
 import logging
 import yaml
@@ -24,10 +25,10 @@ def main():
             e.args = (f'desired datset {dataset} not found in data_config.yml', )
             raise
 
-        data = SequenceData.from_csv(load_path=data_config['load_path'],
-                                    case_identifier=data_config['case_identifier'],
-                                    activity_identifier=data_config['activity_identifier'],
-                                    timestamp_identifier=data_config['timestamp_identifier'])
+        data = SequenceData.from_csv(load_path=os.path.join(DATA_PATH, data_config['file_name']),
+                                     case_identifier=data_config['case_identifier'],
+                                     activity_identifier=data_config['activity_identifier'],
+                                     timestamp_identifier=data_config['timestamp_identifier'])
                 
         log_characteristics = data.get_characteristics()
 

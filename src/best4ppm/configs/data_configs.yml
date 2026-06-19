@@ -10,25 +10,25 @@ BPI2012: # https://data.4tu.nl/articles/_/12689204/1 (needed for dataset convers
   activity_identifier: 'concept:name'
   timestamp_identifier: 'time:timestamp'
 
-BPI2012_Full: # https://data.4tu.nl/articles/_/12689204/1 + BPI2012_conversions.py
+BPI2012_Full: # https://data.4tu.nl/articles/_/12689204/1 + BPI_conversions.py
   file_name: 'BPI2012_Full.csv'
   case_identifier: 'case:concept:name'
   activity_identifier: 'concept:name'
   timestamp_identifier: 'time:timestamp'
 
-BPI2012_W: # https://data.4tu.nl/articles/_/12689204/1 + BPI2012_conversions.py
+BPI2012_W: # https://data.4tu.nl/articles/_/12689204/1 + BPI_conversions.py
   file_name: 'BPI2012_W.csv'
   case_identifier: 'case:concept:name'
   activity_identifier: 'concept:name'
   timestamp_identifier: 'time:timestamp'
 
-BPI2012_C: # https://data.4tu.nl/articles/_/12689204/1 + BPI2012_conversions.py
+BPI2012_C: # https://data.4tu.nl/articles/_/12689204/1 + BPI_conversions.py
   file_name: 'BPI2012_C.csv'
   case_identifier: 'case:concept:name'
   activity_identifier: 'concept:name'
   timestamp_identifier: 'time:timestamp'
 
-BPI2012_WC: # https://data.4tu.nl/articles/_/12689204/1 + BPI2012_conversions.py
+BPI2012_WC: # https://data.4tu.nl/articles/_/12689204/1 + BPI_conversions.py
   file_name: 'BPI2012_WC.csv'
   case_identifier: 'case:concept:name'
   activity_identifier: 'concept:name'
@@ -64,3 +64,20 @@ Nasa: # https://data.4tu.nl/datasets/95edb3e5-8f28-49d7-bffa-72f46c625ca9/1
   activity_identifier: 'concept:name'
   timestamp_identifier: 'time:timestamp'
 
+BPI2017: # https://data.4tu.nl/datasets/34c3f44b-3101-4ea9-8281-e38905c68b8d/1 (needed for dataset conversions)
+  file_name: 'BPI2017.csv'
+  case_identifier: 'case:concept:name'
+  activity_identifier: 'concept:name'
+  timestamp_identifier: 'time:timestamp'
+
+BPI2017_Full: # https://data.4tu.nl/datasets/34c3f44b-3101-4ea9-8281-e38905c68b8d/1 + BPI_conversions.py
+  file_name: 'BPI2017_Full.csv'
+  case_identifier: 'case:concept:name'
+  activity_identifier: 'concept:name'
+  timestamp_identifier: 'time:timestamp'
+
+BPI2019: # https://data.4tu.nl/datasets/35ed7122-966a-484e-a0e1-749b64e3366d/1
+  file_name: 'BPI2019.csv'
+  case_identifier: 'case:concept:name'
+  activity_identifier: 'concept:name'
+  timestamp_identifier: 'time:timestamp'
